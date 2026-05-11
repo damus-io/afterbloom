@@ -21,7 +21,6 @@ pub struct AuthEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Upload,
-    List,
     Delete,
 }
 
@@ -29,7 +28,6 @@ impl Action {
     fn as_str(&self) -> &'static str {
         match self {
             Action::Upload => "upload",
-            Action::List => "list",
             Action::Delete => "delete",
         }
     }

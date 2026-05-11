@@ -66,7 +66,6 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/upload", put(routes::upload).head(routes::upload_head))
-        .route("/list/:pubkey", get(routes::list_owner))
         .route("/:hash", get(routes::get_blob).head(routes::head_blob).delete(routes::delete_blob))
         .layer(DefaultBodyLimit::max(max_upload))
         .layer(cors)

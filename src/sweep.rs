@@ -10,11 +10,11 @@ pub fn spawn(storage: Storage, ratelimit: Arc<RateLimiter>, ttl: Duration, inter
         loop {
             match storage.sweep(ttl).await {
                 Ok(stats) => {
-                    if stats.blobs_deleted > 0 || stats.symlinks_pruned > 0 {
+                    if stats.blobs_deleted > 0 || stats.orphans_pruned > 0 {
                         info!(
                             blobs_deleted = stats.blobs_deleted,
                             bytes_freed = stats.bytes_freed,
-                            symlinks_pruned = stats.symlinks_pruned,
+                            orphans_pruned = stats.orphans_pruned,
                             "sweep complete"
                         );
                     }

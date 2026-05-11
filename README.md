@@ -13,9 +13,9 @@ and short-lived attachments.
 
 ## Spec coverage
 
-- [BUD-01](https://github.com/hzrd149/blossom/blob/master/buds/01.md): GET/HEAD `/<sha256>`
-- [BUD-02](https://github.com/hzrd149/blossom/blob/master/buds/02.md): PUT `/upload`, DELETE `/<sha256>`, GET `/list/<pubkey>`
-- Nostr auth (kind `24242`) is required for `upload`, `delete`, and `list`.
+- [BUD-01](https://github.com/hzrd149/blossom/blob/master/buds/01.md): GET/HEAD `/<sha256>` (with HTTP Range support)
+- [BUD-02](https://github.com/hzrd149/blossom/blob/master/buds/02.md): PUT `/upload`, DELETE `/<sha256>`. `GET /list/<pubkey>` is **not** implemented — afterbloom doesn't expose per-pubkey blob lists.
+- Nostr auth (kind `24242`) is required for `upload` and `delete`.
 
 ## Storage layout
 
@@ -25,8 +25,10 @@ data/
 └── owners/<pubkey>/<sha256> # symlink → ../../blobs/<sha256>
 ```
 
-The `list` endpoint reads `owners/<pubkey>/`. The sweeper deletes any blob whose
-mtime is older than `ttl_seconds`, then prunes dangling owner symlinks.
+`owners/` is an internal per-pubkey reference count used by DELETE: each uploading
+pubkey gets a symlink, and DELETE removes only the caller's symlink. The blob
+itself is removed eagerly when the last symlink goes away. The sweeper deletes
+any blob whose mtime is older than `ttl_seconds` and prunes dangling owner symlinks.
 
 ## Running
 

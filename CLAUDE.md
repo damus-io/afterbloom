@@ -29,9 +29,10 @@ database at all** — filesystem mtime is the expiration clock.
 
 A minimal [Blossom](https://github.com/hzrd149/blossom) server. Specifically:
 
-- **BUD-01**: `GET /<sha256>`, `HEAD /<sha256>`
-- **BUD-02**: `PUT /upload`, `DELETE /<sha256>`, `GET /list/<pubkey>`
-- Nostr auth (kind `24242`) required for upload, delete, list. GET/HEAD are
+- **BUD-01**: `GET /<sha256>`, `HEAD /<sha256>` (with HTTP Range support)
+- **BUD-02**: `PUT /upload`, `DELETE /<sha256>`. `GET /list/<pubkey>` is
+  intentionally **not** implemented (see "No public list endpoint" below).
+- Nostr auth (kind `24242`) required for upload and delete. GET/HEAD are
   unauthenticated.
 
 No database. No payments. No moderation. No image processing. ~1,000 LOC of
@@ -42,31 +43,61 @@ Rust.
 ### Auth: required, any pubkey allowed
 
 The user wanted permissionless uploads (any Nostr pubkey can upload) but not
-truly anonymous — auth makes rate-limiting attribution possible and lets the
-delete/list endpoints work. Spam from rotating keys is contained by the per-IP
-rate limiter.
+truly anonymous — auth makes rate-limiting attribution possible and gates
+delete. Spam from rotating keys is contained by the per-IP rate limiter.
 
-### Storage: filesystem only, with symlinks for ownership
+### Storage: filesystem only, first-uploader-wins
 
 ```
 data/
 ├── blobs/<sha256>           # actual file (mtime = expiration clock)
-├── owners/<pubkey>/<sha256> # symlink → ../../blobs/<sha256>
+├── owners/<sha256>          # sidecar file containing the owner pubkey
 └── tmp/                     # atomic-write staging
 ```
 
-The user explicitly approved "subdirs with symlinks" for the list endpoint
-when asked. Rationale: list-by-pubkey becomes a `readdir` of
-`owners/<pubkey>/` with no extra index. Multiple owners can hold the same
-blob (Blossom is content-addressed) — the blob lives until the sweeper finds
-it stale.
+Single owner per blob. The first pubkey to upload a given hash becomes its
+sole owner; subsequent uploads by other pubkeys return the existing descriptor
+but create no claim and do **not** touch mtime (see "Why first-uploader-wins"
+below). Only the owner can DELETE, and DELETE removes blob + sidecar
+unconditionally and eagerly — no refcount to check.
+
+### Why first-uploader-wins
+
+GET is unauthenticated, so anyone can download any blob. Two attacks fall out
+of a more permissive ownership model:
+
+1. **TTL hijacking.** If re-uploading refreshes mtime regardless of who uploads,
+   any third party can pin someone else's content indefinitely by re-uploading
+   it every TTL-minus-epsilon. First-uploader-wins makes the mtime refresh only
+   work for the owner.
+2. **Recall denial.** If re-uploading grants co-ownership, a third party who
+   downloaded then re-uploaded blocks the original uploader from forcing a
+   delete (their symlink keeps the refcount > 0 until TTL). First-uploader-wins
+   gives one party exclusive recall authority.
+
+Trade-off: if two genuinely independent parties happen to upload the same
+content, only the first gets a claim. For ephemeral storage of content-
+addressed data this is fine — they uploaded the same bytes, the server has
+one copy, and the "second" upload is semantically a no-op confirming the
+content is already there.
+
+### No public list endpoint
+
+The Blossom spec defines `GET /list/<pubkey>` but afterbloom doesn't implement
+it. For a 24h ephemeral server there's little point in advertising "here's
+what pubkey X uploaded today" — everything is gone tomorrow. It would also
+require a secondary index (pubkey → blobs), which the current sidecar layout
+deliberately avoids. If you ever want LIST back, the simplest add is to walk
+`owners/` and group by sidecar contents — or switch to a sqlite index.
 
 ### Why `mtime` and not a separate `expires_at`
 
 For transient storage, "TTL since last touch" is the natural semantic. A
-re-upload of an existing blob refreshes its mtime — this is intentional
-"keep-alive by re-upload" behavior. If you ever need fixed-creation-time
-expiration, switch to reading creation time (e.g. via xattrs or ctime) instead.
+re-upload of an existing blob *by its owner* refreshes its mtime — this is
+intentional "keep-alive by re-upload" behavior. Re-uploads by non-owners do
+not touch mtime (see first-uploader-wins above). If you ever need fixed-
+creation-time expiration, switch to reading creation time (e.g. via xattrs
+or ctime) instead.
 
 ### Web framework: axum
 
@@ -98,8 +129,8 @@ src/
 ├── state.rs        # AppState { cfg, storage, ratelimit }
 ├── auth.rs         # Nostr BUD-01: parse Authorization header, verify
 │                   #   schnorr sig, check kind/expiration/action tags
-├── storage.rs      # Storage::{put, get_path, stat, remove_owner,
-│                   #   list_for_owner, sweep}; symlink management
+├── storage.rs      # Storage::{put, get_path, stat, remove, sweep};
+│                   #   owner sidecar files at owners/<sha256>
 ├── ratelimit.rs    # per-IP token bucket + per-IP byte budget
 ├── sweep.rs        # background task: storage.sweep() every interval
 ├── routes.rs       # all HTTP handlers
@@ -109,16 +140,15 @@ src/
 
 ## Key behaviors and gotchas
 
-- **Re-upload extends TTL.** Uploading the same blob touches mtime. This is
-  the documented "keep-alive" mechanism. Users wanting deterministic expiry
-  should not re-upload.
-- **DELETE removes only the caller's symlink.** The actual blob persists
-  until the sweeper detects no remaining symlinks AND it's stale. This means
-  a DELETE with no other owners doesn't immediately free disk — it's lazy.
-- **List requires same-pubkey auth.** The Blossom spec is ambiguous on
-  whether `GET /list/<pubkey>` requires auth from that pubkey. afterbloom
-  enforces it. Loosen in `routes.rs::list_owner` if public discoverability
-  is wanted.
+- **Owner re-upload extends TTL.** The owner re-uploading the same blob
+  touches mtime. This is the documented "keep-alive" mechanism. Owners
+  wanting deterministic expiry should not re-upload.
+- **Non-owner re-uploads are no-ops.** A second pubkey uploading the same
+  hash gets a successful response with the existing descriptor, but the
+  server does not create any claim for them and does not refresh mtime.
+- **DELETE is eager and exclusive.** Only the owner pubkey can delete; the
+  blob and its owner sidecar are unlinked immediately. 403 if a non-owner
+  tries; 404 if the blob doesn't exist.
 - **Range requests** are supported for single ranges on GET and HEAD:
   `bytes=N-M`, `bytes=N-`, and suffix `bytes=-N`. Invalid/out-of-range
   returns 416 with `Content-Range: bytes */<size>`. Multi-range
@@ -129,8 +159,6 @@ src/
   effectively-infinite tokens.
 - **Rate limit GC is coarse.** In-memory map clears entries idle for 2h.
   For a public server you may want a real LRU.
-- **Linux-only.** `storage::symlink` is gated `#[cfg(unix)]`; the `#[cfg(not(unix))]`
-  branch bails. Symlink ownership tracking won't work on Windows.
 
 ## Smoke testing
 
@@ -148,17 +176,19 @@ curl -X PUT http://127.0.0.1:8765/upload \
   -H "Authorization: $AUTH" \
   --data-binary "@payload.bin"
 
-# Auth events for list/delete take no hash (or a hash)
-AUTH=$(./target/debug/mkauth $SK list 2>/dev/null)
-curl http://127.0.0.1:8765/list/<pubkey> -H "Authorization: $AUTH"
+# Delete auth events must include the hash as an x tag.
+AUTH=$(./target/debug/mkauth $SK delete $HASH 2>/dev/null)
+curl -X DELETE http://127.0.0.1:8765/$HASH -H "Authorization: $AUTH"
 ```
 
 `mkauth` prints the generated `sk`, `pub`, and full event JSON to stderr; the
 base64 `Nostr <...>` header value goes to stdout.
 
-The full smoke flow validated end-to-end:
-upload → get → head → list → wrong-action-rejected → delete → list-empty →
-re-upload → wait for sweeper → 404.
+Smoke flows validated end-to-end:
+- upload → get → head → range get → wrong-action-rejected → owner delete →
+  re-upload → wait for sweeper → 404
+- two-pubkey scenario: alice upload → mallory upload (no claim, same mtime)
+  → mallory delete (403) → alice delete (200, blob + sidecar gone)
 
 ## Config reference
 

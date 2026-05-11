@@ -123,7 +123,10 @@ pub async fn upload(
         });
 
     match state.storage.put(&verified.pubkey, &body, &mime).await {
-        Ok(meta) => Json(BlobDescriptor::from_meta(&state.cfg.public_url, meta)).into_response(),
+        Ok(outcome) => {
+            Json(BlobDescriptor::from_meta(&state.cfg.public_url, outcome.into_meta()))
+                .into_response()
+        }
         Err(e) => {
             tracing::error!("storage put failed: {e:#}");
             error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
@@ -289,42 +292,13 @@ pub async fn delete_blob(
     if !verified.hashes.iter().any(|h| h == &sha) {
         return error(StatusCode::FORBIDDEN, "auth event does not authorize this hash");
     }
-    match state.storage.remove_owner(&verified.pubkey, &sha).await {
-        Ok(true) => StatusCode::OK.into_response(),
-        Ok(false) => error(StatusCode::NOT_FOUND, "you do not own this blob"),
+    use storage::RemoveOutcome;
+    match state.storage.remove(&verified.pubkey, &sha).await {
+        Ok(RemoveOutcome::Removed) => StatusCode::OK.into_response(),
+        Ok(RemoveOutcome::Forbidden) => error(StatusCode::FORBIDDEN, "you do not own this blob"),
+        Ok(RemoveOutcome::NotFound) => error(StatusCode::NOT_FOUND, "blob not found"),
         Err(e) => {
             tracing::error!("delete failed: {e:#}");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
-        }
-    }
-}
-
-pub async fn list_owner(
-    State(state): State<Arc<AppState>>,
-    Path(pubkey): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if pubkey.len() != 64 || !pubkey.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return error(StatusCode::BAD_REQUEST, "invalid pubkey");
-    }
-    // BUD-02 list events are authenticated.
-    let verified = match extract_auth(&headers, Action::List, state.cfg.max_auth_lifetime_seconds) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    if verified.pubkey != pubkey.to_lowercase() {
-        return error(StatusCode::FORBIDDEN, "auth pubkey does not match listed pubkey");
-    }
-    match state.storage.list_for_owner(&pubkey.to_lowercase()).await {
-        Ok(metas) => {
-            let descriptors: Vec<_> = metas
-                .into_iter()
-                .map(|m| BlobDescriptor::from_meta(&state.cfg.public_url, m))
-                .collect();
-            Json(descriptors).into_response()
-        }
-        Err(e) => {
-            tracing::error!("list failed: {e:#}");
             error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
         }
     }

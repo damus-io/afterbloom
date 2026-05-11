@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -18,6 +18,26 @@ pub struct BlobMeta {
     pub mime: String,
 }
 
+/// Outcome of an upload attempt.
+#[derive(Debug)]
+pub enum PutOutcome {
+    /// First upload of this blob — caller is the owner.
+    Created(BlobMeta),
+    /// Blob existed, caller is the existing owner — mtime was refreshed.
+    Refreshed(BlobMeta),
+    /// Blob existed and is owned by someone else. No claim, no mtime refresh.
+    /// The returned meta describes the existing blob.
+    Existing(BlobMeta),
+}
+
+impl PutOutcome {
+    pub fn into_meta(self) -> BlobMeta {
+        match self {
+            PutOutcome::Created(m) | PutOutcome::Refreshed(m) | PutOutcome::Existing(m) => m,
+        }
+    }
+}
+
 impl Storage {
     pub async fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
@@ -32,54 +52,52 @@ impl Storage {
         self.root.join("blobs").join(sha256)
     }
 
-    fn owner_dir(&self, pubkey: &str) -> PathBuf {
-        self.root.join("owners").join(pubkey)
+    fn owner_path(&self, sha256: &str) -> PathBuf {
+        self.root.join("owners").join(sha256)
     }
 
-    fn owner_link(&self, pubkey: &str, sha256: &str) -> PathBuf {
-        self.owner_dir(pubkey).join(sha256)
-    }
-
-    /// Stream `data` to a temp file, hashing as we go. On match-or-empty,
-    /// rename into `blobs/<hash>` (atomic) and create the owner symlink.
-    /// Returns the resulting `BlobMeta`.
-    pub async fn put(&self, pubkey: &str, data: &[u8], mime: &str) -> Result<BlobMeta> {
+    /// Upload semantics (first-uploader-wins):
+    /// - If the blob doesn't exist: write it, record caller as owner.
+    /// - If the blob exists and the caller is its owner: refresh mtime (TTL extended).
+    /// - If the blob exists and the caller is NOT the owner: no-op. The blob's
+    ///   mtime is not touched and no claim is recorded. This prevents a third
+    ///   party from extending someone else's TTL or being able to delete it.
+    pub async fn put(&self, pubkey: &str, data: &[u8], mime: &str) -> Result<PutOutcome> {
         let mut hasher = Sha256::new();
         hasher.update(data);
         let sha256 = hex::encode(hasher.finalize());
 
         let final_path = self.blob_path(&sha256);
+        let blob_exists = fs::metadata(&final_path).await.is_ok();
 
-        // Skip the write if the blob already exists; just refresh mtime so it gets
-        // a fresh TTL.
-        if fs::metadata(&final_path).await.is_ok() {
-            touch(&final_path).await?;
-        } else {
-            let tmp = self.root.join("tmp").join(format!("{sha256}.partial"));
-            let mut f = fs::File::create(&tmp).await?;
-            f.write_all(data).await?;
-            f.sync_all().await?;
-            drop(f);
-            fs::rename(&tmp, &final_path).await?;
+        if blob_exists {
+            let owner = self.read_owner(&sha256).await?;
+            // If the owner sidecar is missing (e.g. crash between blob write and
+            // sidecar write) treat the existing blob as owned by the current
+            // caller: backfill the sidecar and refresh mtime.
+            if owner.as_deref().map_or(true, |o| o == pubkey) {
+                if owner.is_none() {
+                    self.write_owner(&sha256, pubkey).await?;
+                }
+                touch(&final_path).await?;
+                let meta = self.meta_for(&sha256, mime).await?;
+                return Ok(PutOutcome::Refreshed(meta));
+            }
+            let meta = self.meta_for(&sha256, mime).await?;
+            return Ok(PutOutcome::Existing(meta));
         }
 
-        // Create owner symlink (relative target so the data dir stays portable).
-        let owner_dir = self.owner_dir(pubkey);
-        fs::create_dir_all(&owner_dir).await?;
-        let link = self.owner_link(pubkey, &sha256);
-        let _ = fs::remove_file(&link).await;
-        // Symlink target relative to owners/<pubkey>/: ../../blobs/<sha256>
-        symlink(Path::new("../../blobs").join(&sha256), &link).await?;
-        // Touch the symlink itself so list-by-pubkey can show recent uploads.
-        touch_symlink(&link)?;
+        let tmp = self.root.join("tmp").join(format!("{sha256}.partial"));
+        let mut f = fs::File::create(&tmp).await?;
+        f.write_all(data).await?;
+        f.sync_all().await?;
+        drop(f);
+        fs::rename(&tmp, &final_path).await?;
 
-        let meta = fs::metadata(&final_path).await?;
-        Ok(BlobMeta {
-            sha256,
-            size: meta.len(),
-            uploaded_at: mtime_secs(&meta),
-            mime: mime.to_string(),
-        })
+        self.write_owner(&sha256, pubkey).await?;
+
+        let meta = self.meta_for(&sha256, mime).await?;
+        Ok(PutOutcome::Created(meta))
     }
 
     pub async fn get_path(&self, sha256: &str) -> Option<PathBuf> {
@@ -104,52 +122,31 @@ impl Storage {
         }
     }
 
-    /// Remove a single owner's claim on a blob. The blob itself is left in place;
-    /// the sweeper removes it when it expires (or when the last owner is gone and
-    /// it's stale).
-    pub async fn remove_owner(&self, pubkey: &str, sha256: &str) -> Result<bool> {
-        let link = self.owner_link(pubkey, sha256);
-        match fs::remove_file(&link).await {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub async fn list_for_owner(&self, pubkey: &str) -> Result<Vec<BlobMeta>> {
-        let dir = self.owner_dir(pubkey);
-        let mut out = Vec::new();
-        let mut rd = match fs::read_dir(&dir).await {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        while let Some(entry) = rd.next_entry().await? {
-            let name = entry.file_name();
-            let sha = match name.to_str() {
-                Some(s) if is_hex_sha256(s) => s.to_string(),
-                _ => continue,
-            };
-            // Resolve the symlink target's real metadata.
-            match fs::metadata(entry.path()).await {
-                Ok(meta) => {
-                    out.push(BlobMeta {
-                        sha256: sha,
-                        size: meta.len(),
-                        uploaded_at: mtime_secs(&meta),
-                        mime: String::new(),
-                    });
-                }
-                Err(_) => {
-                    // Dangling symlink — clean up opportunistically.
-                    let _ = fs::remove_file(entry.path()).await;
+    /// Result of a delete attempt.
+    pub async fn remove(&self, pubkey: &str, sha256: &str) -> Result<RemoveOutcome> {
+        let owner = self.read_owner(sha256).await?;
+        match owner {
+            None => {
+                // No owner sidecar. If the blob doesn't exist either, treat as
+                // not-found. If the blob exists but has no owner record, refuse
+                // to delete — we can't authorize.
+                if fs::metadata(self.blob_path(sha256)).await.is_ok() {
+                    Ok(RemoveOutcome::Forbidden)
+                } else {
+                    Ok(RemoveOutcome::NotFound)
                 }
             }
+            Some(o) if o == pubkey => {
+                let _ = fs::remove_file(self.blob_path(sha256)).await;
+                let _ = fs::remove_file(self.owner_path(sha256)).await;
+                Ok(RemoveOutcome::Removed)
+            }
+            Some(_) => Ok(RemoveOutcome::Forbidden),
         }
-        Ok(out)
     }
 
-    /// Sweep blobs older than `ttl`. Then sweep dangling owner symlinks.
+    /// Sweep blobs older than `ttl`, removing the owner sidecar alongside.
+    /// Also cleans up any orphan sidecars whose blobs are already gone.
     pub async fn sweep(&self, ttl: Duration) -> Result<SweepStats> {
         let mut stats = SweepStats::default();
         let cutoff = SystemTime::now() - ttl;
@@ -158,59 +155,108 @@ impl Storage {
         let mut rd = fs::read_dir(&blobs_dir).await?;
         while let Some(entry) = rd.next_entry().await? {
             let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !is_hex_sha256(name) {
+                continue;
+            }
             let meta = match fs::metadata(&path).await {
                 Ok(m) => m,
                 Err(_) => continue,
             };
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            if mtime < cutoff {
-                if fs::remove_file(&path).await.is_ok() {
-                    stats.blobs_deleted += 1;
-                    stats.bytes_freed += meta.len();
-                }
+            if mtime < cutoff && fs::remove_file(&path).await.is_ok() {
+                stats.blobs_deleted += 1;
+                stats.bytes_freed += meta.len();
+                let _ = fs::remove_file(self.owner_path(name)).await;
             }
         }
 
+        // Orphan sidecars (blob gone but sidecar lingered — e.g. crash between
+        // the two unlinks above).
         let owners_dir = self.root.join("owners");
-        let mut rd = match fs::read_dir(&owners_dir).await {
-            Ok(rd) => rd,
-            Err(_) => return Ok(stats),
-        };
-        while let Some(user_entry) = rd.next_entry().await? {
-            let user_dir = user_entry.path();
-            let mut user_rd = match fs::read_dir(&user_dir).await {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let mut remaining = 0u32;
-            while let Some(link_entry) = user_rd.next_entry().await? {
-                // metadata() (not symlink_metadata) follows the link; if the target
-                // is gone, this errors and we drop the dangling link.
-                if fs::metadata(link_entry.path()).await.is_err() {
-                    let _ = fs::remove_file(link_entry.path()).await;
-                    stats.symlinks_pruned += 1;
-                } else {
-                    remaining += 1;
+        if let Ok(mut rd) = fs::read_dir(&owners_dir).await {
+            while let Some(entry) = rd.next_entry().await? {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !is_hex_sha256(name) {
+                    continue;
                 }
-            }
-            if remaining == 0 {
-                let _ = fs::remove_dir(&user_dir).await;
+                if fs::metadata(self.blob_path(name)).await.is_err() {
+                    let _ = fs::remove_file(&path).await;
+                    stats.orphans_pruned += 1;
+                }
             }
         }
 
         Ok(stats)
     }
+
+    async fn read_owner(&self, sha256: &str) -> Result<Option<String>> {
+        match fs::read_to_string(self.owner_path(sha256)).await {
+            Ok(s) => {
+                let trimmed = s.trim();
+                if is_hex_pubkey(trimmed) {
+                    Ok(Some(trimmed.to_string()))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn write_owner(&self, sha256: &str, pubkey: &str) -> Result<()> {
+        let path = self.owner_path(sha256);
+        // Atomic-ish: write to tmp then rename. Owners dir is created at open().
+        let tmp = self
+            .root
+            .join("tmp")
+            .join(format!("{sha256}.owner.partial"));
+        let mut f = fs::File::create(&tmp).await?;
+        f.write_all(pubkey.as_bytes()).await?;
+        f.write_all(b"\n").await?;
+        f.sync_all().await?;
+        drop(f);
+        fs::rename(&tmp, &path).await?;
+        Ok(())
+    }
+
+    async fn meta_for(&self, sha256: &str, mime: &str) -> Result<BlobMeta> {
+        let meta = fs::metadata(self.blob_path(sha256)).await?;
+        Ok(BlobMeta {
+            sha256: sha256.to_string(),
+            size: meta.len(),
+            uploaded_at: mtime_secs(&meta),
+            mime: mime.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    Removed,
+    Forbidden,
+    NotFound,
 }
 
 #[derive(Debug, Default)]
 pub struct SweepStats {
     pub blobs_deleted: u64,
     pub bytes_freed: u64,
-    pub symlinks_pruned: u64,
+    pub orphans_pruned: u64,
 }
 
 pub fn is_hex_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_hex_pubkey(s: &str) -> bool {
+    is_hex_sha256(s)
 }
 
 /// Strip an optional `.ext` suffix from the URL path so `/<sha>.png` works.
@@ -243,23 +289,4 @@ async fn touch(path: &Path) -> Result<()> {
     .await
     .map_err(|e| anyhow!("join: {e}"))??;
     Ok(())
-}
-
-fn touch_symlink(_path: &Path) -> Result<()> {
-    // Symlink mtime is set at creation time on Linux; nothing extra needed.
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn symlink(target: PathBuf, link: &Path) -> Result<()> {
-    let link = link.to_path_buf();
-    tokio::task::spawn_blocking(move || std::os::unix::fs::symlink(target, link))
-        .await
-        .map_err(|e| anyhow!("join: {e}"))?
-        .context("creating symlink")
-}
-
-#[cfg(not(unix))]
-async fn symlink(_target: PathBuf, _link: &Path) -> Result<()> {
-    bail!("symlinks not supported on this platform")
 }
