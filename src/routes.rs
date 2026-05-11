@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
 use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::auth::{self, Action};
@@ -154,6 +155,7 @@ pub async fn upload_head(
 pub async fn get_blob(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let sha = match storage::parse_sha_from_path(&path) {
         Some(s) => s,
@@ -164,7 +166,7 @@ pub async fn get_blob(
         None => return error(StatusCode::NOT_FOUND, "blob not found"),
     };
 
-    let file = match tokio::fs::File::open(&file_path).await {
+    let mut file = match tokio::fs::File::open(&file_path).await {
         Ok(f) => f,
         Err(_) => return error(StatusCode::NOT_FOUND, "blob not found"),
     };
@@ -172,16 +174,53 @@ pub async fn get_blob(
         Ok(m) => m,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "stat failed"),
     };
+    let total = meta.len();
 
     let mime = sniff_mime(&file_path).await.unwrap_or_else(|| "application/octet-stream".to_string());
 
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let range = match range_header {
+        Some(raw) => match parse_range(raw, total) {
+            ParsedRange::Valid(s, e) => Some((s, e)),
+            ParsedRange::Unsupported => None,
+            ParsedRange::Invalid => {
+                let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+                let cr = format!("bytes */{}", total);
+                if let Ok(v) = HeaderValue::from_str(&cr) {
+                    resp.headers_mut().insert(header::CONTENT_RANGE, v);
+                }
+                return resp;
+            }
+        },
+        None => None,
+    };
 
-    let mut resp = body.into_response();
+    let (status, body, content_length, content_range) = match range {
+        Some((start, end)) => {
+            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+                return error(StatusCode::INTERNAL_SERVER_ERROR, "seek failed");
+            }
+            let len = end - start + 1;
+            let stream = ReaderStream::new(file.take(len));
+            let body = Body::from_stream(stream);
+            let cr = format!("bytes {}-{}/{}", start, end, total);
+            (StatusCode::PARTIAL_CONTENT, body, len, Some(cr))
+        }
+        None => {
+            let stream = ReaderStream::new(file);
+            (StatusCode::OK, Body::from_stream(stream), total, None)
+        }
+    };
+
+    let mut resp = (status, body).into_response();
     resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap());
-    resp.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(meta.len()));
+    resp.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(content_length));
     resp.headers_mut().insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Some(cr) = content_range {
+        if let Ok(v) = HeaderValue::from_str(&cr) {
+            resp.headers_mut().insert(header::CONTENT_RANGE, v);
+        }
+    }
     if let Ok(expires_at) = expires_at_header(&meta, state.cfg.ttl_seconds) {
         resp.headers_mut().insert("x-expires-at", expires_at);
     }
@@ -191,6 +230,7 @@ pub async fn get_blob(
 pub async fn head_blob(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let sha = match storage::parse_sha_from_path(&path) {
         Some(s) => s,
@@ -200,9 +240,36 @@ pub async fn head_blob(
         Ok(Some(m)) => m,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let mut resp = StatusCode::OK.into_response();
-    resp.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(meta.size));
+
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let (status, content_length, content_range) = match range_header {
+        Some(raw) => match parse_range(raw, meta.size) {
+            ParsedRange::Valid(s, e) => (
+                StatusCode::PARTIAL_CONTENT,
+                e - s + 1,
+                Some(format!("bytes {}-{}/{}", s, e, meta.size)),
+            ),
+            ParsedRange::Unsupported => (StatusCode::OK, meta.size, None),
+            ParsedRange::Invalid => {
+                let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+                let cr = format!("bytes */{}", meta.size);
+                if let Ok(v) = HeaderValue::from_str(&cr) {
+                    resp.headers_mut().insert(header::CONTENT_RANGE, v);
+                }
+                return resp;
+            }
+        },
+        None => (StatusCode::OK, meta.size, None),
+    };
+
+    let mut resp = status.into_response();
+    resp.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(content_length));
     resp.headers_mut().insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Some(cr) = content_range {
+        if let Ok(v) = HeaderValue::from_str(&cr) {
+            resp.headers_mut().insert(header::CONTENT_RANGE, v);
+        }
+    }
     resp
 }
 
@@ -276,5 +343,115 @@ fn expires_at_header(meta: &std::fs::Metadata, ttl_seconds: u64) -> Result<Heade
     let mtime = meta.modified().map_err(|_| ())?;
     let secs = mtime.duration_since(UNIX_EPOCH).map_err(|_| ())?.as_secs();
     HeaderValue::from_str(&(secs + ttl_seconds).to_string()).map_err(|_| ())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedRange {
+    Valid(u64, u64),
+    Unsupported,
+    Invalid,
+}
+
+fn parse_range(raw: &str, total: u64) -> ParsedRange {
+    let Some(spec) = raw.strip_prefix("bytes=") else {
+        return ParsedRange::Invalid;
+    };
+    if spec.contains(',') {
+        return ParsedRange::Unsupported;
+    }
+    let Some((start_s, end_s)) = spec.split_once('-') else {
+        return ParsedRange::Invalid;
+    };
+    let start_s = start_s.trim();
+    let end_s = end_s.trim();
+
+    if start_s.is_empty() {
+        let Ok(n) = end_s.parse::<u64>() else {
+            return ParsedRange::Invalid;
+        };
+        if n == 0 || total == 0 {
+            return ParsedRange::Invalid;
+        }
+        let n = n.min(total);
+        ParsedRange::Valid(total - n, total - 1)
+    } else {
+        let Ok(start) = start_s.parse::<u64>() else {
+            return ParsedRange::Invalid;
+        };
+        if total == 0 || start >= total {
+            return ParsedRange::Invalid;
+        }
+        let end = if end_s.is_empty() {
+            total - 1
+        } else {
+            let Ok(e) = end_s.parse::<u64>() else {
+                return ParsedRange::Invalid;
+            };
+            e.min(total - 1)
+        };
+        if start > end {
+            return ParsedRange::Invalid;
+        }
+        ParsedRange::Valid(start, end)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_simple() {
+        assert_eq!(parse_range("bytes=0-99", 1000), ParsedRange::Valid(0, 99));
+        assert_eq!(parse_range("bytes=100-199", 1000), ParsedRange::Valid(100, 199));
+    }
+
+    #[test]
+    fn range_open_ended() {
+        assert_eq!(parse_range("bytes=500-", 1000), ParsedRange::Valid(500, 999));
+    }
+
+    #[test]
+    fn range_suffix() {
+        assert_eq!(parse_range("bytes=-200", 1000), ParsedRange::Valid(800, 999));
+        // suffix larger than file clamps to the whole file.
+        assert_eq!(parse_range("bytes=-5000", 1000), ParsedRange::Valid(0, 999));
+    }
+
+    #[test]
+    fn range_end_clamps_to_file_size() {
+        assert_eq!(parse_range("bytes=0-9999", 1000), ParsedRange::Valid(0, 999));
+    }
+
+    #[test]
+    fn range_invalid_start_past_end_of_file() {
+        assert_eq!(parse_range("bytes=1000-", 1000), ParsedRange::Invalid);
+        assert_eq!(parse_range("bytes=2000-3000", 1000), ParsedRange::Invalid);
+    }
+
+    #[test]
+    fn range_invalid_start_greater_than_end() {
+        assert_eq!(parse_range("bytes=500-100", 1000), ParsedRange::Invalid);
+    }
+
+    #[test]
+    fn range_invalid_suffix_zero_or_empty_file() {
+        assert_eq!(parse_range("bytes=-0", 1000), ParsedRange::Invalid);
+        assert_eq!(parse_range("bytes=-100", 0), ParsedRange::Invalid);
+        assert_eq!(parse_range("bytes=0-", 0), ParsedRange::Invalid);
+    }
+
+    #[test]
+    fn range_invalid_syntax() {
+        assert_eq!(parse_range("items=0-99", 1000), ParsedRange::Invalid);
+        assert_eq!(parse_range("bytes=abc-def", 1000), ParsedRange::Invalid);
+        assert_eq!(parse_range("bytes=0", 1000), ParsedRange::Invalid);
+    }
+
+    #[test]
+    fn range_multi_unsupported() {
+        // Multi-range gets treated as "ignore the header and return full body".
+        assert_eq!(parse_range("bytes=0-99,200-299", 1000), ParsedRange::Unsupported);
+    }
 }
 

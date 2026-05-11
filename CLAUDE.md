@@ -119,9 +119,11 @@ src/
   whether `GET /list/<pubkey>` requires auth from that pubkey. afterbloom
   enforces it. Loosen in `routes.rs::list_owner` if public discoverability
   is wanted.
-- **No range request support.** `accept-ranges: bytes` is advertised but the
-  GET handler streams the whole file. Add `tower-http`'s `ServeFile` if
-  needed.
+- **Range requests** are supported for single ranges on GET and HEAD:
+  `bytes=N-M`, `bytes=N-`, and suffix `bytes=-N`. Invalid/out-of-range
+  returns 416 with `Content-Range: bytes */<size>`. Multi-range
+  (`bytes=0-9,20-29`) is treated as unsupported and falls back to a full
+  200 response — allowed by RFC 9110. See `parse_range` in `routes.rs`.
 - **Auth event lifetime cap.** `max_auth_lifetime_seconds` (default 1h) caps
   how far in the future the auth event's `expiration` tag may be — prevents
   effectively-infinite tokens.
@@ -171,7 +173,6 @@ re-upload → wait for sweeper → 404.
 
 ## Possible future work (not requested, just noted)
 
-- Range request support (real `ServeFile` integration)
 - LRU rate limit table
 - Persistent rate-limit state across restarts
 - BUD-04 mirror endpoint
