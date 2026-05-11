@@ -1,0 +1,24 @@
+listen = "0.0.0.0:8000"
+storage_dir = "./data"
+public_url = "http://localhost:8000"
+
+# How long blobs live before being swept. Default: 24h.
+ttl_seconds = 86400
+
+# How often the sweeper runs.
+sweep_interval_seconds = 300
+
+# Max upload size in bytes. Default: 100 MiB.
+max_upload_bytes = 104857600
+
+# Max acceptable skew (seconds) for the auth event `expiration` tag in the future.
+# Auth events expiring further than this are rejected to prevent infinite-lifetime tokens.
+max_auth_lifetime_seconds = 3600
+
+[ratelimit]
+# Per-IP token bucket. Each IP gets `burst` tokens and refills at `refill_per_minute`/min.
+uploads_burst = 10
+uploads_refill_per_minute = 10
+
+# Per-IP byte budget per hour.
+bytes_per_hour = 1073741824
